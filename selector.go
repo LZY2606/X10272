@@ -43,7 +43,7 @@ func directSelector(key gval.Evaluable) plainSelector {
 // * / [*]
 func starSelector() ambiguousSelector {
 	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
-		visitAll(v, func(key string, val interface{}) { match(key, val) })
+		visitAll(c, v, func(key string, val interface{}) { match(key, val) })
 	}
 }
 
@@ -135,33 +135,85 @@ func mapperSelector() ambiguousSelector {
 }
 
 func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	state := visitStateFromContext(c)
+	if err := state.charge(c); err != nil {
+		return
+	}
 	match([]interface{}{}, v)
-	visitAll(v, func(wildcard string, v interface{}) {
-		mapper(c, r, v, func(key interface{}, v interface{}) {
+	visitAll(c, v, func(wildcard string, child interface{}) {
+		if state.err != nil {
+			return
+		}
+		mapper(c, r, child, func(key interface{}, v interface{}) {
 			match(append([]interface{}{wildcard}, key.([]interface{})...), v)
 		})
 	})
 }
 
-func visitAll(v interface{}, visit func(key string, v interface{})) {
+func visitAll(c context.Context, v interface{}, visit func(key string, v interface{})) {
 
 	switch v := v.(type) {
 
 	case []interface{}:
 		for i, e := range v {
 			k := strconv.Itoa(i)
+			if visitStateFromContext(c).err != nil {
+				return
+			}
 			visit(k, e)
 		}
 
 	case map[string]interface{}:
-		for k, e := range v {
-			visit(k, e)
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		if sorted := deterministicMapKeys(c, keys); sorted != nil {
+			keys = sorted
+		}
+		for _, k := range keys {
+			if visitStateFromContext(c).err != nil {
+				return
+			}
+			visit(k, v[k])
 		}
 
 	case Array:
+		if deterministicOrder(c) {
+			ordered := map[string]interface{}{}
+			v.ForEach(func(key string, val interface{}) { ordered[key] = val })
+			keys := make([]string, 0, len(ordered))
+			for k := range ordered {
+				keys = append(keys, k)
+			}
+			keys = deterministicMapKeys(c, keys)
+			for _, k := range keys {
+				if visitStateFromContext(c).err != nil {
+					return
+				}
+				visit(k, ordered[k])
+			}
+			return
+		}
 		v.ForEach(visit)
 
 	case Object:
+		if deterministicOrder(c) {
+			ordered := map[string]interface{}{}
+			v.ForEach(func(key string, val interface{}) { ordered[key] = val })
+			keys := make([]string, 0, len(ordered))
+			for k := range ordered {
+				keys = append(keys, k)
+			}
+			keys = deterministicMapKeys(c, keys)
+			for _, k := range keys {
+				if visitStateFromContext(c).err != nil {
+					return
+				}
+				visit(k, ordered[k])
+			}
+			return
+		}
 		v.ForEach(visit)
 	}
 }
@@ -169,7 +221,7 @@ func visitAll(v interface{}, visit func(key string, v interface{})) {
 // [? ]
 func filterSelector(filter gval.Evaluable) ambiguousSelector {
 	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
-		visitAll(v, func(wildcard string, v interface{}) {
+		visitAll(c, v, func(wildcard string, v interface{}) {
 			condition, err := filter.EvalBool(currentContext(c, v), r)
 			if err != nil {
 				return
