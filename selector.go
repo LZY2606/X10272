@@ -3,6 +3,7 @@ package jsonpath
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/PaesslerAG/gval"
@@ -135,6 +136,9 @@ func mapperSelector() ambiguousSelector {
 }
 
 func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	if b, ok := c.Value(visitBudgetContextKey{}).(*visitBudget); ok && !b.consume(c) {
+		return
+	}
 	match([]interface{}{}, v)
 	visitAll(v, func(wildcard string, v interface{}) {
 		mapper(c, r, v, func(key interface{}, v interface{}) {
@@ -143,6 +147,8 @@ func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) {
 	})
 }
 
+// visitAll visits all direct elements of v. Map elements are visited in
+// sorted key order so traversal order is reproducible.
 func visitAll(v interface{}, visit func(key string, v interface{})) {
 
 	switch v := v.(type) {
@@ -154,8 +160,13 @@ func visitAll(v interface{}, visit func(key string, v interface{})) {
 		}
 
 	case map[string]interface{}:
-		for k, e := range v {
-			visit(k, e)
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			visit(k, v[k])
 		}
 
 	case Array:

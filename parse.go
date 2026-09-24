@@ -50,11 +50,12 @@ func (p *parser) parse(c context.Context) (r gval.Evaluable, err error) {
 	if err != nil {
 		return nil, err
 	}
+	eval := p.path.evaluate
 	collectFullPaths := c.Value(CollectFullPathsContextKey{})
 	if b, ok := collectFullPaths.(bool); ok && b {
-		return p.path.evaluateWithPaths, nil
+		eval = p.path.evaluateWithPaths
 	}
-	return p.path.evaluate, nil
+	return withBudget(eval), nil
 }
 
 func (p *parser) parsePath(c context.Context) error {

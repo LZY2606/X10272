@@ -109,10 +109,14 @@ func (j *jsonObjectSlice) addElements(e jsonObject) {
 }
 
 func (j jsonObjectSlice) evaluable(c context.Context, v interface{}) (interface{}, error) {
+	c, budget := budgetContext(c)
 	vs := map[string]interface{}{}
 
 	err := j.visitElements(c, v, func(key string, value interface{}) { vs[key] = value })
 	if err != nil {
+		return nil, err
+	}
+	if err := budget.Err(); err != nil {
 		return nil, err
 	}
 	return vs, nil
