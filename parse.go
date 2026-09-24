@@ -52,9 +52,13 @@ func (p *parser) parse(c context.Context) (r gval.Evaluable, err error) {
 	}
 	collectFullPaths := c.Value(CollectFullPathsContextKey{})
 	if b, ok := collectFullPaths.(bool); ok && b {
-		return p.path.evaluateWithPaths, nil
+		return func(ctx context.Context, parameter interface{}) (interface{}, error) {
+			return p.path.evaluateWithPaths(newVisitContext(ctx), parameter)
+		}, nil
 	}
-	return p.path.evaluate, nil
+	return func(ctx context.Context, parameter interface{}) (interface{}, error) {
+		return p.path.evaluate(newVisitContext(ctx), parameter)
+	}, nil
 }
 
 func (p *parser) parsePath(c context.Context) error {

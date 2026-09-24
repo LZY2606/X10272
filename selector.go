@@ -3,6 +3,7 @@ package jsonpath
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/PaesslerAG/gval"
@@ -43,7 +44,7 @@ func directSelector(key gval.Evaluable) plainSelector {
 // * / [*]
 func starSelector() ambiguousSelector {
 	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
-		visitAll(v, func(key string, val interface{}) { match(key, val) })
+		visitAll(c, v, func(key string, val interface{}) { match(key, val) })
 	}
 }
 
@@ -135,41 +136,75 @@ func mapperSelector() ambiguousSelector {
 }
 
 func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	c = chargeDescentVisit(c)
+	if visitAborted(c) {
+		return
+	}
 	match([]interface{}{}, v)
-	visitAll(v, func(wildcard string, v interface{}) {
-		mapper(c, r, v, func(key interface{}, v interface{}) {
+	visitAll(c, v, func(wildcard string, child interface{}) {
+		mapper(c, r, child, func(key interface{}, v interface{}) {
 			match(append([]interface{}{wildcard}, key.([]interface{})...), v)
 		})
+		releaseDescentDepth(c)
 	})
 }
 
-func visitAll(v interface{}, visit func(key string, v interface{})) {
+func visitAll(c context.Context, v interface{}, visit func(key string, v interface{})) {
 
 	switch v := v.(type) {
 
 	case []interface{}:
 		for i, e := range v {
-			k := strconv.Itoa(i)
-			visit(k, e)
+			visit(strconv.Itoa(i), e)
+			if visitAborted(c) {
+				return
+			}
 		}
 
 	case map[string]interface{}:
-		for k, e := range v {
-			visit(k, e)
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			visit(k, v[k])
+			if visitAborted(c) {
+				return
+			}
 		}
 
 	case Array:
-		v.ForEach(visit)
+		v.ForEach(func(k string, e interface{}) {
+			if visitAborted(c) {
+				return
+			}
+			visit(k, e)
+		})
 
 	case Object:
-		v.ForEach(visit)
+		elements := map[string]interface{}{}
+		v.ForEach(func(k string, e interface{}) {
+			elements[k] = e
+		})
+		keys := make([]string, 0, len(elements))
+		for k := range elements {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			visit(k, elements[k])
+			if visitAborted(c) {
+				return
+			}
+		}
 	}
 }
 
 // [? ]
 func filterSelector(filter gval.Evaluable) ambiguousSelector {
 	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
-		visitAll(v, func(wildcard string, v interface{}) {
+		visitAll(c, v, func(wildcard string, v interface{}) {
 			condition, err := filter.EvalBool(currentContext(c, v), r)
 			if err != nil {
 				return

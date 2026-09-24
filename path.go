@@ -22,14 +22,20 @@ type ambiguousMatcher func(key, v interface{})
 
 func (p plainPath) evaluate(ctx context.Context, root interface{}) (interface{}, error) {
 	_, value, err := p.evaluatePath(ctx, root, root)
-	return value, err
+	if err != nil {
+		return value, err
+	}
+	return value, visitStateError(ctx)
 }
 
 func (p plainPath) evaluateWithPaths(ctx context.Context, root interface{}) (interface{}, error) {
 	keys, value, err := p.evaluatePath(ctx, root, root)
 	m := map[string]interface{}{}
 	m[toJSONPath(keys)] = value
-	return m, err
+	if err != nil {
+		return m, err
+	}
+	return m, visitStateError(ctx)
 }
 
 func (p plainPath) evaluatePath(ctx context.Context, root, value interface{}) ([]interface{}, interface{}, error) {
@@ -92,7 +98,7 @@ func (p *ambiguousPath) evaluate(ctx context.Context, parameter interface{}) (in
 	p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) {
 		matchs = append(matchs, match)
 	})
-	return matchs, nil
+	return matchs, visitStateError(ctx)
 }
 
 func (p *ambiguousPath) evaluateWithPaths(ctx context.Context, parameter interface{}) (interface{}, error) {
@@ -100,6 +106,9 @@ func (p *ambiguousPath) evaluateWithPaths(ctx context.Context, parameter interfa
 	p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) {
 		m[toJSONPath(convertPath(keys))] = match
 	})
+	if err := visitStateError(ctx); err != nil {
+		return nil, err
+	}
 	return m, nil
 }
 
