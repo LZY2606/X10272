@@ -52,7 +52,7 @@ func parseJSONObject(ctx context.Context, p *gval.Parser) (gval.Evaluable, error
 			evals.addElements(e)
 		case ',':
 		case '}':
-			return evals.evaluable, nil
+			return withVisitControl(evals.evaluable), nil
 		}
 	}
 }
@@ -63,7 +63,7 @@ func parseJSONObjectElement(ctx context.Context, gParser *gval.Parser, hasWildca
 		switch gParser.Scan() {
 		case '$':
 		case '@':
-			p.appendPlainSelector(currentElementSelector())
+			p.appendPlainSelector(currentElementSelector{})
 		default:
 			return nil, p.Expected("JSONPath key and value")
 		}

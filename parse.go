@@ -21,7 +21,7 @@ func parseRootPath(ctx context.Context, gParser *gval.Parser) (r gval.Evaluable,
 
 func parseCurrentPath(ctx context.Context, gParser *gval.Parser) (r gval.Evaluable, err error) {
 	p := newParser(gParser)
-	p.appendPlainSelector(currentElementSelector())
+	p.appendPlainSelector(currentElementSelector{})
 	eval, err := p.parse(ctx)
 	// We always want to ensure that the machinery to collect values with paths is circumvented for current path
 	return func(ctx context.Context, parameter interface{}) (interface{}, error) {
@@ -52,9 +52,9 @@ func (p *parser) parse(c context.Context) (r gval.Evaluable, err error) {
 	}
 	collectFullPaths := c.Value(CollectFullPathsContextKey{})
 	if b, ok := collectFullPaths.(bool); ok && b {
-		return p.path.evaluateWithPaths, nil
+		return withVisitControl(p.path.evaluateWithPaths), nil
 	}
-	return p.path.evaluate, nil
+	return withVisitControl(p.path.evaluate), nil
 }
 
 func (p *parser) parsePath(c context.Context) error {
@@ -75,17 +75,20 @@ func (p *parser) parsePath(c context.Context) error {
 			}
 			keys = append(keys, []gval.Evaluable{
 				p.Const(0), p.Const(float64(math.MaxInt32)), p.Const(1)}[len(keys):]...)
-			p.appendAmbiguousSelector(rangeSelector(keys[0], keys[1], keys[2]))
+			p.appendAmbiguousSelector(rangeSelector{min: keys[0], max: keys[1], step: keys[2]})
 		case '?':
 			if len(keys) != 1 {
 				return fmt.Errorf("filter needs exactly one key")
 			}
-			p.appendAmbiguousSelector(filterSelector(keys[0]))
+			p.appendAmbiguousSelector(filterSelector{filter: keys[0]})
 		default:
-			if len(keys) == 1 {
-				p.appendPlainSelector(directSelector(keys[0]))
-			} else {
-				p.appendAmbiguousSelector(multiSelector(keys))
+			switch len(keys) {
+			case 1:
+				p.appendPlainSelector(directSelector{key: keys[0]})
+			case 0:
+				p.appendAmbiguousSelector(starSelector{})
+			default:
+				p.appendAmbiguousSelector(multiSelector{keys: keys})
 			}
 		}
 		return p.parsePath(c)
@@ -101,13 +104,13 @@ func (p *parser) parseSelect(c context.Context) error {
 	scan := p.Scan()
 	switch scan {
 	case scanner.Ident:
-		p.appendPlainSelector(directSelector(p.Const(p.TokenText())))
+		p.appendPlainSelector(directSelector{key: p.Const(p.TokenText())})
 		return p.parsePath(c)
 	case '.':
-		p.appendAmbiguousSelector(mapperSelector())
+		p.appendAmbiguousSelector(mapperSelector{})
 		return p.parseMapper(c)
 	case '*':
-		p.appendAmbiguousSelector(starSelector())
+		p.appendAmbiguousSelector(starSelector{})
 		return p.parsePath(c)
 	default:
 		return p.Expected("JSON select", scanner.Ident, '.', '*')
@@ -174,7 +177,7 @@ func (p *parser) parseMapper(c context.Context) error {
 	scan := p.Scan()
 	switch scan {
 	case scanner.Ident:
-		p.appendPlainSelector(directSelector(p.Const(p.TokenText())))
+		p.appendPlainSelector(directSelector{key: p.Const(p.TokenText())})
 	case '[':
 		keys, seperator, err := p.parseBracket(c)
 
@@ -188,12 +191,16 @@ func (p *parser) parseMapper(c context.Context) error {
 			if len(keys) != 1 {
 				return fmt.Errorf("filter needs exactly one key")
 			}
-			p.appendAmbiguousSelector(filterSelector(keys[0]))
+			p.appendAmbiguousSelector(filterSelector{filter: keys[0]})
 		default:
-			p.appendAmbiguousSelector(multiSelector(keys))
+			if len(keys) == 0 {
+				p.appendAmbiguousSelector(starSelector{})
+			} else {
+				p.appendAmbiguousSelector(multiSelector{keys: keys})
+			}
 		}
 	case '*':
-		p.appendAmbiguousSelector(starSelector())
+		p.appendAmbiguousSelector(starSelector{})
 	case '(':
 		return p.parseScript(c)
 	default:
@@ -210,7 +217,7 @@ func (p *parser) parseScript(c context.Context) error {
 	if p.Scan() != ')' {
 		return p.Expected("jsonpath script", ')')
 	}
-	p.appendPlainSelector(newScript(script))
+	p.appendPlainSelector(scriptSelector{script: script})
 	return p.parsePath(c)
 }
 
@@ -220,4 +227,32 @@ func (p *parser) appendPlainSelector(next plainSelector) {
 
 func (p *parser) appendAmbiguousSelector(next ambiguousSelector) {
 	p.path = p.path.withAmbiguousSelector(next)
+}
+
+// parseSegments parses expr with the production parser (newParser + parser.parse,
+// the same code path used by New) and returns the flattened selector segments
+// of the resulting path. It is an internal test-only hook: nothing is parsed or
+// built differently, the path built during the real parse is captured.
+func parseSegments(expr string) ([]pathSegment, error) {
+	var captured path
+	capture := gval.NewLanguage(
+		gval.Base(),
+		gval.PrefixExtension('$', func(ctx context.Context, gParser *gval.Parser) (gval.Evaluable, error) {
+			p := newParser(gParser)
+			eval, err := p.parse(ctx)
+			captured = p.path
+			return eval, err
+		}),
+		gval.PrefixExtension('@', func(ctx context.Context, gParser *gval.Parser) (gval.Evaluable, error) {
+			p := newParser(gParser)
+			p.appendPlainSelector(currentElementSelector{})
+			eval, err := p.parse(ctx)
+			captured = p.path
+			return eval, err
+		}),
+	)
+	if _, err := capture.NewEvaluable(expr); err != nil {
+		return nil, err
+	}
+	return pathSegments(captured), nil
 }

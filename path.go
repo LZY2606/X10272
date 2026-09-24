@@ -35,7 +35,7 @@ func (p plainPath) evaluateWithPaths(ctx context.Context, root interface{}) (int
 func (p plainPath) evaluatePath(ctx context.Context, root, value interface{}) ([]interface{}, interface{}, error) {
 	keys := []interface{}{}
 	for _, sel := range p {
-		k, v, err := sel(ctx, root, value)
+		k, v, err := sel.selectPlain(ctx, root, value)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -105,13 +105,13 @@ func (p *ambiguousPath) evaluateWithPaths(ctx context.Context, parameter interfa
 
 func (p *ambiguousPath) visitMatchs(ctx context.Context, r interface{}, visit pathMatcher) {
 	p.parent.visitMatchs(ctx, r, func(keys []interface{}, v interface{}) {
-		p.branch(ctx, r, v, p.ending.matcher(ctx, r, visit.matcher(keys)))
+		p.branch.selectAmbiguous(ctx, r, v, p.ending.matcher(ctx, r, visit.matcher(keys)))
 	})
 }
 
 func (p *ambiguousPath) branchMatcher(ctx context.Context, r interface{}, m ambiguousMatcher) ambiguousMatcher {
 	return func(k, v interface{}) {
-		p.branch(ctx, r, v, m)
+		p.branch.selectAmbiguous(ctx, r, v, m)
 	}
 }
 
@@ -161,4 +161,38 @@ func toJSONPath(segments []interface{}) string {
 	quoteWildcardValues(&sb, convertPath(segments))
 
 	return sb.String()
+}
+
+// pathSegment is one selector segment of a parsed path. Exactly one of plain
+// and ambiguous is set. This flattened view of the parser result exists so the
+// parser output can be handed to the restricted reference interpreter used by
+// the internal tests; it carries the same selector values the production
+// evaluation path below invokes, it does not re-parse or re-build anything.
+type pathSegment struct {
+	plain     plainSelector
+	ambiguous ambiguousSelector
+}
+
+func (s pathSegment) isAmbiguous() bool {
+	return s.ambiguous != nil
+}
+
+func pathSegments(p path) []pathSegment {
+	switch p := p.(type) {
+	case plainPath:
+		segments := make([]pathSegment, 0, len(p))
+		for _, sel := range p {
+			segments = append(segments, pathSegment{plain: sel})
+		}
+		return segments
+	case *ambiguousPath:
+		segments := pathSegments(p.parent)
+		segments = append(segments, pathSegment{ambiguous: p.branch})
+		for _, sel := range p.ending {
+			segments = append(segments, pathSegment{plain: sel})
+		}
+		return segments
+	default:
+		return nil
+	}
 }
