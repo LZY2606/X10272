@@ -3,6 +3,7 @@ package jsonpath
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/PaesslerAG/gval"
@@ -134,7 +135,70 @@ func mapperSelector() ambiguousSelector {
 	return mapper
 }
 
+// defaultRecursiveVisitBudget bounds the number of nodes a single recursive
+// descent (..) evaluation may visit, so cyclic or extremely deep structures
+// cannot make an evaluation run forever.
+const defaultRecursiveVisitBudget = 100000
+
+// RecursiveVisitBudgetContextKey can be set to an int on the evaluation
+// context to override defaultRecursiveVisitBudget for a single evaluation.
+//
+// Exported for testing purposes
+type RecursiveVisitBudgetContextKey struct{}
+
+// recursiveVisitBudget is the per-evaluation state for recursive descent.
+// It is created fresh for every top level evaluation and carried through the
+// context, so a failed or exhausted evaluation can never leak state into a
+// reused Evaluable.
+type recursiveVisitBudget struct {
+	remaining int
+	err       error
+}
+
+type recursiveVisitBudgetContextKey struct{}
+
+// withRecursiveVisitBudget returns a context carrying the recursive descent
+// visit budget and the budget itself. If a budget is already present it is
+// reused, so nested ambiguous paths share one budget per evaluation.
+func withRecursiveVisitBudget(c context.Context) (context.Context, *recursiveVisitBudget) {
+	if b, ok := c.Value(recursiveVisitBudgetContextKey{}).(*recursiveVisitBudget); ok {
+		return c, b
+	}
+	max := defaultRecursiveVisitBudget
+	if m, ok := c.Value(RecursiveVisitBudgetContextKey{}).(int); ok {
+		max = m
+	}
+	b := &recursiveVisitBudget{remaining: max}
+	return context.WithValue(c, recursiveVisitBudgetContextKey{}, b), b
+}
+
+// visit records one visited node. It returns false once the evaluation must
+// stop, either because the context was cancelled or because the visit budget
+// is exhausted; the causal error is kept on the budget.
+func (b *recursiveVisitBudget) visit(c context.Context) bool {
+	if b.err != nil {
+		return false
+	}
+	if err := c.Err(); err != nil {
+		b.err = err
+		return false
+	}
+	if b.remaining <= 0 {
+		b.err = fmt.Errorf("jsonpath: recursive descent visit budget exhausted")
+		return false
+	}
+	b.remaining--
+	return true
+}
+
 func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	if b, ok := c.Value(recursiveVisitBudgetContextKey{}).(*recursiveVisitBudget); ok {
+		if !b.visit(c) {
+			return
+		}
+	} else if c.Err() != nil {
+		return
+	}
 	match([]interface{}{}, v)
 	visitAll(v, func(wildcard string, v interface{}) {
 		mapper(c, r, v, func(key interface{}, v interface{}) {
@@ -143,6 +207,9 @@ func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) {
 	})
 }
 
+// visitAll enumerates the direct children of v. Object keys are visited in
+// sorted order so that wildcard and recursive descent evaluations produce a
+// reproducible match order independent of Go map iteration.
 func visitAll(v interface{}, visit func(key string, v interface{})) {
 
 	switch v := v.(type) {
@@ -154,8 +221,13 @@ func visitAll(v interface{}, visit func(key string, v interface{})) {
 		}
 
 	case map[string]interface{}:
-		for k, e := range v {
-			visit(k, e)
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			visit(k, v[k])
 		}
 
 	case Array:
