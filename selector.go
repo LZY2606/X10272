@@ -2,11 +2,63 @@ package jsonpath
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/PaesslerAG/gval"
 )
+
+// RecursiveDescentBudgetContextKey limits how many values a single evaluation
+// visits while executing a recursive descent selector (".."). The context
+// value must be a positive int. It is exported so callers (and tests) can bound
+// recursive descent through the public evaluation entry points without any
+// side channel.
+type RecursiveDescentBudgetContextKey struct{}
+
+// ErrRecursiveDescentBudgetExceeded is the causal error returned when a
+// recursive descent visits more values than the configured
+// RecursiveDescentBudgetContextKey budget.
+var ErrRecursiveDescentBudgetExceeded = errors.New("jsonpath: recursive descent visit budget exceeded")
+
+// traversalState is created fresh for every evaluation and never shared
+// between evaluable calls. It carries the per-evaluation recursive descent
+// counter as well as the first causal failure (budget exhaustion or context
+// cancellation).
+type traversalState struct {
+	visits int
+	err    error
+}
+
+type traversalStateContextKey struct{}
+
+// beginTraversal installs a fresh traversalState when the caller bound a
+// recursive descent budget or a cancellable context. Evaluations without
+// either keep the original, allocation free behaviour.
+func beginTraversal(c context.Context) (context.Context, *traversalState) {
+	_, hasBudget := c.Value(RecursiveDescentBudgetContextKey{}).(int)
+	if !hasBudget && c.Done() == nil {
+		return c, nil
+	}
+	state := &traversalState{}
+	return context.WithValue(c, traversalStateContextKey{}, state), state
+}
+
+func traversalStateOf(c context.Context) *traversalState {
+	state, _ := c.Value(traversalStateContextKey{}).(*traversalState)
+	return state
+}
+
+// traversalFailed reports the first causal failure of the current evaluation,
+// if any. Ambiguous selectors stop emitting matches once it is set so a failed
+// traversal can never contribute partial results.
+func traversalFailed(c context.Context) error {
+	if state := traversalStateOf(c); state != nil {
+		return state.err
+	}
+	return nil
+}
 
 // plainSelector evaluate exactly one result
 type plainSelector func(c context.Context, r, v interface{}) (interface{}, interface{}, error)
@@ -135,12 +187,40 @@ func mapperSelector() ambiguousSelector {
 }
 
 func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	if !chargeRecursiveDescent(c) {
+		return
+	}
 	match([]interface{}{}, v)
 	visitAll(v, func(wildcard string, v interface{}) {
 		mapper(c, r, v, func(key interface{}, v interface{}) {
 			match(append([]interface{}{wildcard}, key.([]interface{})...), v)
 		})
 	})
+}
+
+// chargeRecursiveDescent accounts for one visited value of a recursive
+// descent. It enforces the per-evaluation visit budget and honours context
+// cancellation, recording the first causal failure on the traversalState.
+func chargeRecursiveDescent(c context.Context) bool {
+	state := traversalStateOf(c)
+	if state == nil {
+		return true
+	}
+	if state.err != nil {
+		return false
+	}
+	if err := c.Err(); err != nil {
+		state.err = err
+		return false
+	}
+	if budget, ok := c.Value(RecursiveDescentBudgetContextKey{}).(int); ok {
+		state.visits++
+		if state.visits > budget {
+			state.err = ErrRecursiveDescentBudgetExceeded
+			return false
+		}
+	}
+	return true
 }
 
 func visitAll(v interface{}, visit func(key string, v interface{})) {
@@ -154,15 +234,28 @@ func visitAll(v interface{}, visit func(key string, v interface{})) {
 		}
 
 	case map[string]interface{}:
-		for k, e := range v {
-			visit(k, e)
-		}
+		visitSortedMap(keysOf(v), v, visit)
 
 	case Array:
 		v.ForEach(visit)
 
 	case Object:
 		v.ForEach(visit)
+	}
+}
+
+func keysOf(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func visitSortedMap(keys []string, m map[string]interface{}, visit func(key string, v interface{})) {
+	sort.Strings(keys)
+	for _, k := range keys {
+		visit(k, m[k])
 	}
 }
 
