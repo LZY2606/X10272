@@ -101,7 +101,12 @@ func (kv keyValueMatcher) visitElements(c context.Context, v interface{}, visit 
 		}
 		visit(key, match)
 	})
-	return
+	if err != nil {
+		return err
+	}
+	// surface causal errors (cancellation, exhausted visit budget) that
+	// stopped the underlying path evaluation
+	return visitError(c)
 }
 
 func (j *jsonObjectSlice) addElements(e jsonObject) {

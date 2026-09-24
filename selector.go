@@ -2,7 +2,9 @@ package jsonpath
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/PaesslerAG/gval"
@@ -134,13 +136,37 @@ func mapperSelector() ambiguousSelector {
 	return mapper
 }
 
+// ErrVisitBudgetExhausted is returned when recursive descent (..) visits more
+// nodes than allowed by the *int budget stored under VisitBudgetContextKey.
+var ErrVisitBudgetExhausted = errors.New("jsonpath: recursive descent visit budget exhausted")
+
 func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	if c.Err() != nil || !spendVisit(c) {
+		return
+	}
 	match([]interface{}{}, v)
 	visitAll(v, func(wildcard string, v interface{}) {
 		mapper(c, r, v, func(key interface{}, v interface{}) {
 			match(append([]interface{}{wildcard}, key.([]interface{})...), v)
 		})
 	})
+}
+
+// spendVisit accounts one visited node against the recursive descent visit
+// budget carried by the context. It reports false once the budget is
+// exhausted and marks it negative so the evaluation can report
+// ErrVisitBudgetExhausted via visitError.
+func spendVisit(c context.Context) bool {
+	budget, ok := c.Value(VisitBudgetContextKey{}).(*int)
+	if !ok || budget == nil {
+		return true
+	}
+	if *budget <= 0 {
+		*budget = -1
+		return false
+	}
+	*budget--
+	return true
 }
 
 func visitAll(v interface{}, visit func(key string, v interface{})) {
@@ -154,8 +180,14 @@ func visitAll(v interface{}, visit func(key string, v interface{})) {
 		}
 
 	case map[string]interface{}:
-		for k, e := range v {
-			visit(k, e)
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		// sort keys so object traversal order is reproducible
+		sort.Strings(keys)
+		for _, k := range keys {
+			visit(k, v[k])
 		}
 
 	case Array:

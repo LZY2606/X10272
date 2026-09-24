@@ -8,6 +8,15 @@ import (
 // Exported for testing purposes
 type CollectFullPathsContextKey struct{}
 
+// VisitBudgetContextKey is the context key for a *int visit budget that
+// limits how many nodes recursive descent (..) may visit during a single
+// evaluation. Each visited node decrements the budget; once the budget is
+// exhausted evaluation stops and returns ErrVisitBudgetExhausted.
+// A nil budget or a missing context value means unlimited visits.
+//
+// Exported for testing purposes
+type VisitBudgetContextKey struct{}
+
 type path interface {
 	evaluate(c context.Context, parameter interface{}) (interface{}, error)
 	evaluateWithPaths(c context.Context, parameter interface{}) (interface{}, error)
@@ -92,6 +101,9 @@ func (p *ambiguousPath) evaluate(ctx context.Context, parameter interface{}) (in
 	p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) {
 		matchs = append(matchs, match)
 	})
+	if err := visitError(ctx); err != nil {
+		return nil, err
+	}
 	return matchs, nil
 }
 
@@ -100,7 +112,22 @@ func (p *ambiguousPath) evaluateWithPaths(ctx context.Context, parameter interfa
 	p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) {
 		m[toJSONPath(convertPath(keys))] = match
 	})
+	if err := visitError(ctx); err != nil {
+		return nil, err
+	}
 	return m, nil
+}
+
+// visitError reports the causal error that stopped an ambiguous evaluation:
+// a cancelled context or an exhausted recursive descent visit budget.
+func visitError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if budget, ok := ctx.Value(VisitBudgetContextKey{}).(*int); ok && budget != nil && *budget < 0 {
+		return ErrVisitBudgetExhausted
+	}
+	return nil
 }
 
 func (p *ambiguousPath) visitMatchs(ctx context.Context, r interface{}, visit pathMatcher) {
