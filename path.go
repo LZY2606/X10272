@@ -8,6 +8,36 @@ import (
 // Exported for testing purposes
 type CollectFullPathsContextKey struct{}
 
+// VisitBudgetContextKey is exported for testing purposes. If a context
+// carries a positive int under this key, recursive descent during that
+// evaluation visits at most that many nodes before failing with an error.
+type VisitBudgetContextKey struct{}
+
+const defaultRecursiveDescentBudget = 100000
+
+// evalState is the per-evaluation state shared by all selectors of one
+// evaluation. It is created fresh by the top level evaluation entry points
+// so reused evaluables never carry counters or errors across evaluations.
+type evalState struct {
+	visits int
+	budget int
+	err    error
+}
+
+type evalStateContextKey struct{}
+
+func ensureEvalState(c context.Context) (context.Context, *evalState) {
+	if s, ok := c.Value(evalStateContextKey{}).(*evalState); ok {
+		return c, s
+	}
+	budget := defaultRecursiveDescentBudget
+	if b, ok := c.Value(VisitBudgetContextKey{}).(int); ok && b > 0 {
+		budget = b
+	}
+	s := &evalState{budget: budget}
+	return context.WithValue(c, evalStateContextKey{}, s), s
+}
+
 type path interface {
 	evaluate(c context.Context, parameter interface{}) (interface{}, error)
 	evaluateWithPaths(c context.Context, parameter interface{}) (interface{}, error)
@@ -88,18 +118,26 @@ type ambiguousPath struct {
 }
 
 func (p *ambiguousPath) evaluate(ctx context.Context, parameter interface{}) (interface{}, error) {
+	ctx, state := ensureEvalState(ctx)
 	matchs := []interface{}{}
 	p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) {
 		matchs = append(matchs, match)
 	})
+	if state.err != nil {
+		return nil, state.err
+	}
 	return matchs, nil
 }
 
 func (p *ambiguousPath) evaluateWithPaths(ctx context.Context, parameter interface{}) (interface{}, error) {
+	ctx, state := ensureEvalState(ctx)
 	m := map[string]interface{}{}
 	p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) {
 		m[toJSONPath(convertPath(keys))] = match
 	})
+	if state.err != nil {
+		return nil, state.err
+	}
 	return m, nil
 }
 
