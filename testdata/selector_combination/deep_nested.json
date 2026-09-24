@@ -1,0 +1,11 @@
+{
+  "level1": {
+    "level2": {
+      "level3": {
+        "level4": { "leaf": 42 }
+      }
+    },
+    "sibling": [1, 2, { "deep": "yes" }]
+  },
+  "top": "value"
+}
