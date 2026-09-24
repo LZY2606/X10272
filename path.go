@@ -3,10 +3,46 @@ package jsonpath
 import (
 	"bytes"
 	"context"
+	"errors"
 )
 
 // Exported for testing purposes
 type CollectFullPathsContextKey struct{}
+
+// MaxMapperVisitsContextKey can be set to an int > 0 to bound the number of
+// nodes a single evaluation may visit during recursive descent (..).
+// Exported for testing purposes
+type MaxMapperVisitsContextKey struct{}
+
+// DefaultMaxMapperVisits bounds recursive descent of a single evaluation
+// if no explicit budget is provided through MaxMapperVisitsContextKey.
+const DefaultMaxMapperVisits = 100000
+
+// ErrMapperVisitsExhausted is returned by an evaluation whose recursive
+// descent exceeds its visit budget.
+var ErrMapperVisitsExhausted = errors.New("jsonpath: recursive descent visit budget exhausted")
+
+type mapperBudgetContextKey struct{}
+
+// mapperBudget is the per-evaluation visit budget shared by all recursive
+// descents of one evaluation. It is installed by the public evaluation
+// entry points and therefore never survives a single evaluation call.
+type mapperBudget struct {
+	remaining int
+	err       error
+}
+
+func withMapperBudget(c context.Context) (context.Context, *mapperBudget) {
+	if b, ok := c.Value(mapperBudgetContextKey{}).(*mapperBudget); ok {
+		return c, b
+	}
+	limit := DefaultMaxMapperVisits
+	if l, ok := c.Value(MaxMapperVisitsContextKey{}).(int); ok && l > 0 {
+		limit = l
+	}
+	b := &mapperBudget{remaining: limit}
+	return context.WithValue(c, mapperBudgetContextKey{}, b), b
+}
 
 type path interface {
 	evaluate(c context.Context, parameter interface{}) (interface{}, error)
@@ -88,18 +124,26 @@ type ambiguousPath struct {
 }
 
 func (p *ambiguousPath) evaluate(ctx context.Context, parameter interface{}) (interface{}, error) {
+	ctx, budget := withMapperBudget(ctx)
 	matchs := []interface{}{}
 	p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) {
 		matchs = append(matchs, match)
 	})
+	if budget.err != nil {
+		return nil, budget.err
+	}
 	return matchs, nil
 }
 
 func (p *ambiguousPath) evaluateWithPaths(ctx context.Context, parameter interface{}) (interface{}, error) {
+	ctx, budget := withMapperBudget(ctx)
 	m := map[string]interface{}{}
 	p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) {
 		m[toJSONPath(convertPath(keys))] = match
 	})
+	if budget.err != nil {
+		return nil, budget.err
+	}
 	return m, nil
 }
 

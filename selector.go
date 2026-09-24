@@ -3,6 +3,7 @@ package jsonpath
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/PaesslerAG/gval"
@@ -135,9 +136,28 @@ func mapperSelector() ambiguousSelector {
 }
 
 func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	budget, _ := c.Value(mapperBudgetContextKey{}).(*mapperBudget)
+	mapAll(c, budget, r, v, match)
+}
+
+func mapAll(c context.Context, budget *mapperBudget, r, v interface{}, match ambiguousMatcher) {
+	if budget != nil {
+		if budget.err != nil {
+			return
+		}
+		if err := c.Err(); err != nil {
+			budget.err = err
+			return
+		}
+		if budget.remaining <= 0 {
+			budget.err = ErrMapperVisitsExhausted
+			return
+		}
+		budget.remaining--
+	}
 	match([]interface{}{}, v)
 	visitAll(v, func(wildcard string, v interface{}) {
-		mapper(c, r, v, func(key interface{}, v interface{}) {
+		mapAll(c, budget, r, v, func(key interface{}, v interface{}) {
 			match(append([]interface{}{wildcard}, key.([]interface{})...), v)
 		})
 	})
@@ -154,8 +174,13 @@ func visitAll(v interface{}, visit func(key string, v interface{})) {
 		}
 
 	case map[string]interface{}:
-		for k, e := range v {
-			visit(k, e)
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			visit(k, v[k])
 		}
 
 	case Array:
