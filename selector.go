@@ -2,7 +2,9 @@ package jsonpath
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/PaesslerAG/gval"
@@ -11,8 +13,11 @@ import (
 // plainSelector evaluate exactly one result
 type plainSelector func(c context.Context, r, v interface{}) (interface{}, interface{}, error)
 
-// ambiguousSelector evaluate wildcard
-type ambiguousSelector func(c context.Context, r, v interface{}, match ambiguousMatcher)
+// ambiguousSelector evaluate wildcard.
+// A returned error is fatal (e.g. context cancellation or an exhausted
+// visit budget) and aborts the whole evaluation. Non-matching branches
+// are not errors and must be skipped silently instead.
+type ambiguousSelector func(c context.Context, r, v interface{}, match ambiguousMatcher) error
 
 // @
 func currentElementSelector() plainSelector {
@@ -42,8 +47,8 @@ func directSelector(key gval.Evaluable) plainSelector {
 
 // * / [*]
 func starSelector() ambiguousSelector {
-	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
-		visitAll(v, func(key string, val interface{}) { match(key, val) })
+	return func(c context.Context, r, v interface{}, match ambiguousMatcher) error {
+		return visitAll(v, func(key string, val interface{}) error { return match(key, val) })
 	}
 }
 
@@ -52,14 +57,17 @@ func multiSelector(keys []gval.Evaluable) ambiguousSelector {
 	if len(keys) == 0 {
 		return starSelector()
 	}
-	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	return func(c context.Context, r, v interface{}, match ambiguousMatcher) error {
 		for _, k := range keys {
 			e, wildcard, err := selectValue(c, k, r, v)
 			if err != nil {
 				continue
 			}
-			match(wildcard, e)
+			if err := match(wildcard, e); err != nil {
+				return err
+			}
 		}
+		return nil
 	}
 }
 
@@ -134,49 +142,109 @@ func mapperSelector() ambiguousSelector {
 	return mapper
 }
 
-func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) {
-	match([]interface{}{}, v)
-	visitAll(v, func(wildcard string, v interface{}) {
-		mapper(c, r, v, func(key interface{}, v interface{}) {
-			match(append([]interface{}{wildcard}, key.([]interface{})...), v)
+func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) error {
+	if err := c.Err(); err != nil {
+		return err
+	}
+	c, budget := visitBudget(c)
+	if budget.remaining < 1 {
+		return ErrVisitBudgetExhausted
+	}
+	budget.remaining--
+	if err := match([]interface{}{}, v); err != nil {
+		return err
+	}
+	return visitAll(v, func(wildcard string, v interface{}) error {
+		return mapper(c, r, v, func(key interface{}, v interface{}) error {
+			return match(append([]interface{}{wildcard}, key.([]interface{})...), v)
 		})
 	})
 }
 
-func visitAll(v interface{}, visit func(key string, v interface{})) {
+// ErrVisitBudgetExhausted is returned by an evaluation when recursive
+// descent ($..) visits more nodes than the visit budget allows.
+var ErrVisitBudgetExhausted = errors.New("jsonpath: recursive descent visit budget exhausted")
 
+// VisitBudgetContextKey is exported for testing purposes. If a context
+// carries an int value under this key, recursive descent ($..) visits at
+// most that many nodes during one evaluation, otherwise defaultVisitBudget
+// applies. The budget is spent per evaluation, so evaluables stay reusable.
+type VisitBudgetContextKey struct{}
+
+const defaultVisitBudget = 1 << 20
+
+type visitCounterKey struct{}
+
+type visitCounter struct {
+	remaining int
+}
+
+func visitBudget(c context.Context) (context.Context, *visitCounter) {
+	if counter, ok := c.Value(visitCounterKey{}).(*visitCounter); ok {
+		return c, counter
+	}
+	budget := defaultVisitBudget
+	if b, ok := c.Value(VisitBudgetContextKey{}).(int); ok {
+		budget = b
+	}
+	counter := &visitCounter{remaining: budget}
+	return context.WithValue(c, visitCounterKey{}, counter), counter
+}
+
+func visitAll(v interface{}, visit func(key string, v interface{}) error) error {
 	switch v := v.(type) {
 
 	case []interface{}:
 		for i, e := range v {
-			k := strconv.Itoa(i)
-			visit(k, e)
+			if err := visit(strconv.Itoa(i), e); err != nil {
+				return err
+			}
 		}
 
 	case map[string]interface{}:
-		for k, e := range v {
-			visit(k, e)
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		// sort keys so object traversal order is reproducible
+		sort.Strings(keys)
+		for _, k := range keys {
+			if err := visit(k, v[k]); err != nil {
+				return err
+			}
 		}
 
 	case Array:
-		v.ForEach(visit)
+		return visitEach(v.ForEach, visit)
 
 	case Object:
-		v.ForEach(visit)
+		return visitEach(v.ForEach, visit)
 	}
+	return nil
+}
+
+func visitEach(forEach func(func(string, interface{})), visit func(key string, v interface{}) error) error {
+	var err error
+	forEach(func(key string, v interface{}) {
+		if err == nil {
+			err = visit(key, v)
+		}
+	})
+	return err
 }
 
 // [? ]
 func filterSelector(filter gval.Evaluable) ambiguousSelector {
-	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
-		visitAll(v, func(wildcard string, v interface{}) {
+	return func(c context.Context, r, v interface{}, match ambiguousMatcher) error {
+		return visitAll(v, func(wildcard string, v interface{}) error {
 			condition, err := filter.EvalBool(currentContext(c, v), r)
 			if err != nil {
-				return
+				return nil
 			}
 			if condition {
-				match(wildcard, v)
+				return match(wildcard, v)
 			}
+			return nil
 		})
 	}
 }
@@ -184,21 +252,21 @@ func filterSelector(filter gval.Evaluable) ambiguousSelector {
 // [::]
 func rangeSelector(min, max, step gval.Evaluable) ambiguousSelector {
 
-	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	return func(c context.Context, r, v interface{}, match ambiguousMatcher) error {
 
 		c = currentContext(c, v)
 
 		min, err := min.EvalInt(c, r)
 		if err != nil {
-			return
+			return nil
 		}
 		max, err := max.EvalInt(c, r)
 		if err != nil {
-			return
+			return nil
 		}
 		step, err := step.EvalInt(c, r)
 		if err != nil {
-			return
+			return nil
 		}
 
 		if step == 0 {
@@ -214,16 +282,20 @@ func rangeSelector(min, max, step gval.Evaluable) ambiguousSelector {
 			max = negmax(max, n)
 
 			if min > max {
-				return
+				return nil
 			}
 
 			if step > 0 {
 				for i := min; i < max; i += step {
-					match(strconv.Itoa(i), o[i])
+					if err := match(strconv.Itoa(i), o[i]); err != nil {
+						return err
+					}
 				}
 			} else {
 				for i := max - 1; i >= min; i += step {
-					match(strconv.Itoa(i), o[i])
+					if err := match(strconv.Itoa(i), o[i]); err != nil {
+						return err
+					}
 				}
 			}
 
@@ -233,23 +305,28 @@ func rangeSelector(min, max, step gval.Evaluable) ambiguousSelector {
 			max = negmax(max, n)
 
 			if min > max {
-				return
+				return nil
 			}
 
 			if step > 0 {
 				for i := min; i < max; i += step {
 					k := strconv.Itoa(i)
 					r, _ := o.SelectGVal(c, k)
-					match(k, r)
+					if err := match(k, r); err != nil {
+						return err
+					}
 				}
 			} else {
 				for i := max - 1; i >= min; i += step {
 					k := strconv.Itoa(i)
 					r, _ := o.SelectGVal(c, k)
-					match(k, r)
+					if err := match(k, r); err != nil {
+						return err
+					}
 				}
 			}
 		}
+		return nil
 	}
 }
 

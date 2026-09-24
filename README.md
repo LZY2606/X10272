@@ -9,3 +9,9 @@ JSONPath can be combined with a script language. In many web samples it's combin
 
 It is based on [Gval](https://github.com/PaesslerAG/gval) and can be combined with the modular expression languages based on gval.
 So for script features like multiply, length, regex or many more take a look at the documentation in the [GoDoc](https://godoc.org/github.com/PaesslerAG/jsonpath).
+
+Evaluation guarantees
+====
+
+* Object wildcard and recursive descent (`$..`) traverse `map[string]interface{}` keys in sorted order, so results are reproducible across runs.
+* Recursive descent has a per-evaluation visit budget (default `1<<20` nodes). An `int` stored under `jsonpath.VisitBudgetContextKey{}` in the evaluation context overrides it; exceeding the budget fails the evaluation with `jsonpath.ErrVisitBudgetExhausted`. Cancelling the evaluation context aborts recursive descent with the context's error.
