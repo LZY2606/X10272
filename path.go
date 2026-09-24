@@ -88,18 +88,26 @@ type ambiguousPath struct {
 }
 
 func (p *ambiguousPath) evaluate(ctx context.Context, parameter interface{}) (interface{}, error) {
+	ctx = ensureDescentState(ctx)
 	matchs := []interface{}{}
 	p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) {
 		matchs = append(matchs, match)
 	})
+	if err := recursiveDescentError(ctx); err != nil {
+		return nil, err
+	}
 	return matchs, nil
 }
 
 func (p *ambiguousPath) evaluateWithPaths(ctx context.Context, parameter interface{}) (interface{}, error) {
+	ctx = ensureDescentState(ctx)
 	m := map[string]interface{}{}
 	p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) {
 		m[toJSONPath(convertPath(keys))] = match
 	})
+	if err := recursiveDescentError(ctx); err != nil {
+		return nil, err
+	}
 	return m, nil
 }
 
