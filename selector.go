@@ -3,6 +3,7 @@ package jsonpath
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/PaesslerAG/gval"
@@ -135,6 +136,12 @@ func mapperSelector() ambiguousSelector {
 }
 
 func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	guard, _ := c.Value(descentBudgetKey{}).(*descentGuard)
+	if guard != nil {
+		if err := guard.enter(c); err != nil {
+			return
+		}
+	}
 	match([]interface{}{}, v)
 	visitAll(v, func(wildcard string, v interface{}) {
 		mapper(c, r, v, func(key interface{}, v interface{}) {
@@ -148,21 +155,60 @@ func visitAll(v interface{}, visit func(key string, v interface{})) {
 	switch v := v.(type) {
 
 	case []interface{}:
+		pairs := make([]keyValuePairVisit, 0, len(v))
 		for i, e := range v {
-			k := strconv.Itoa(i)
-			visit(k, e)
+			pairs = append(pairs, keyValuePairVisit{strconv.Itoa(i), e})
 		}
+		visitPairsInKeyOrder(pairs, visit)
 
 	case map[string]interface{}:
+		pairs := make([]keyValuePairVisit, 0, len(v))
 		for k, e := range v {
-			visit(k, e)
+			pairs = append(pairs, keyValuePairVisit{k, e})
 		}
+		visitPairsInKeyOrder(pairs, visit)
 
 	case Array:
-		v.ForEach(visit)
+		pairs := []keyValuePairVisit{}
+		v.ForEach(func(key string, value interface{}) {
+			pairs = append(pairs, keyValuePairVisit{key, value})
+		})
+		visitPairsInKeyOrder(pairs, visit)
 
 	case Object:
-		v.ForEach(visit)
+		pairs := []keyValuePairVisit{}
+		v.ForEach(func(key string, value interface{}) {
+			pairs = append(pairs, keyValuePairVisit{key, value})
+		})
+		visitPairsInKeyOrder(pairs, visit)
+	}
+}
+
+type keyValuePairVisit struct {
+	key   string
+	value interface{}
+}
+
+func visitPairsInKeyOrder(pairs []keyValuePairVisit, visit func(key string, v interface{})) {
+	allNumeric := len(pairs) > 0
+	for _, p := range pairs {
+		if _, err := strconv.Atoi(p.key); err != nil {
+			allNumeric = false
+			break
+		}
+	}
+	sort.SliceStable(pairs, func(i, j int) bool {
+		if allNumeric {
+			ni, _ := strconv.Atoi(pairs[i].key)
+			nj, _ := strconv.Atoi(pairs[j].key)
+			if ni != nj {
+				return ni < nj
+			}
+		}
+		return pairs[i].key < pairs[j].key
+	})
+	for _, p := range pairs {
+		visit(p.key, p.value)
 	}
 }
 

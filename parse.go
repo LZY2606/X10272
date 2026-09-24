@@ -52,9 +52,21 @@ func (p *parser) parse(c context.Context) (r gval.Evaluable, err error) {
 	}
 	collectFullPaths := c.Value(CollectFullPathsContextKey{})
 	if b, ok := collectFullPaths.(bool); ok && b {
-		return p.path.evaluateWithPaths, nil
+		return withPerEvaluationDescentBudget(p.path.evaluateWithPaths), nil
 	}
-	return p.path.evaluate, nil
+	return withPerEvaluationDescentBudget(p.path.evaluate), nil
+}
+
+func withPerEvaluationDescentBudget(eval func(c context.Context, parameter interface{}) (interface{}, error)) gval.Evaluable {
+	return func(ctx context.Context, parameter interface{}) (interface{}, error) {
+		ctx = withDescentGuard(ctx, ctx.Value(DescentBudgetContextKey{}))
+		result, err := eval(ctx, parameter)
+		guard, _ := ctx.Value(descentBudgetKey{}).(*descentGuard)
+		if guard != nil && guard.fatal != nil {
+			return nil, guard.fatal
+		}
+		return result, err
+	}
 }
 
 func (p *parser) parsePath(c context.Context) error {

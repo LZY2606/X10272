@@ -111,9 +111,13 @@ func (j *jsonObjectSlice) addElements(e jsonObject) {
 func (j jsonObjectSlice) evaluable(c context.Context, v interface{}) (interface{}, error) {
 	vs := map[string]interface{}{}
 
+	c = withDescentGuard(c, c.Value(DescentBudgetContextKey{}))
 	err := j.visitElements(c, v, func(key string, value interface{}) { vs[key] = value })
 	if err != nil {
 		return nil, err
+	}
+	if guard, ok := c.Value(descentBudgetKey{}).(*descentGuard); ok && guard.fatal != nil {
+		return nil, guard.fatal
 	}
 	return vs, nil
 }
