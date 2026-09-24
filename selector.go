@@ -3,6 +3,7 @@ package jsonpath
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/PaesslerAG/gval"
@@ -134,7 +135,55 @@ func mapperSelector() ambiguousSelector {
 	return mapper
 }
 
+// MapperVisitBudgetContextKey is the context key under which a
+// *MapperVisitBudget can be attached to bound the number of nodes a
+// recursive descent (..) visits during one evaluation.
+// Exported for testing purposes
+type MapperVisitBudgetContextKey struct{}
+
+// MapperVisitBudget bounds how many nodes recursive descent (..) may visit.
+// The zero value is not valid; set Limit explicitly.
+// A negative Limit means unlimited visits.
+// A budget is consumed by the production mapper recursion itself, so it
+// protects every code path that evaluates recursive descent. Reusing one
+// budget across evaluations accumulates its consumption.
+type MapperVisitBudget struct {
+	Limit int
+
+	visits    int
+	exhausted bool
+}
+
+// consume accounts for one visited node and reports whether the evaluation
+// may continue.
+func (b *MapperVisitBudget) consume() bool {
+	if b.Limit < 0 {
+		return true
+	}
+	if b.visits >= b.Limit {
+		b.exhausted = true
+		return false
+	}
+	b.visits++
+	return true
+}
+
+// Visits returns how many nodes have been visited so far.
+func (b *MapperVisitBudget) Visits() int {
+	return b.visits
+}
+
+// Exhausted reports whether the budget stopped the recursive descent.
+func (b *MapperVisitBudget) Exhausted() bool {
+	return b.exhausted
+}
+
 func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	if budget, ok := c.Value(MapperVisitBudgetContextKey{}).(*MapperVisitBudget); ok && budget != nil {
+		if !budget.consume() {
+			return
+		}
+	}
 	match([]interface{}{}, v)
 	visitAll(v, func(wildcard string, v interface{}) {
 		mapper(c, r, v, func(key interface{}, v interface{}) {
@@ -154,7 +203,14 @@ func visitAll(v interface{}, visit func(key string, v interface{})) {
 		}
 
 	case map[string]interface{}:
-		for k, e := range v {
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		// sort keys so wildcard and recursive descent traversal order is reproducible
+		sort.Strings(keys)
+		for _, k := range keys {
+			e := v[k]
 			visit(k, e)
 		}
 
