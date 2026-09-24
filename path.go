@@ -21,15 +21,29 @@ type plainPath []plainSelector
 type ambiguousMatcher func(key, v interface{})
 
 func (p plainPath) evaluate(ctx context.Context, root interface{}) (interface{}, error) {
+	ctx, state := withVisitState(ctx)
 	_, value, err := p.evaluatePath(ctx, root, root)
-	return value, err
+	if err != nil {
+		return nil, err
+	}
+	if state.err != nil {
+		return nil, state.err
+	}
+	return value, nil
 }
 
 func (p plainPath) evaluateWithPaths(ctx context.Context, root interface{}) (interface{}, error) {
+	ctx, state := withVisitState(ctx)
 	keys, value, err := p.evaluatePath(ctx, root, root)
+	if err != nil {
+		return nil, err
+	}
+	if state.err != nil {
+		return nil, state.err
+	}
 	m := map[string]interface{}{}
 	m[toJSONPath(keys)] = value
-	return m, err
+	return m, nil
 }
 
 func (p plainPath) evaluatePath(ctx context.Context, root, value interface{}) ([]interface{}, interface{}, error) {
@@ -88,18 +102,26 @@ type ambiguousPath struct {
 }
 
 func (p *ambiguousPath) evaluate(ctx context.Context, parameter interface{}) (interface{}, error) {
+	ctx, state := withVisitState(ctx)
 	matchs := []interface{}{}
 	p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) {
 		matchs = append(matchs, match)
 	})
+	if state.err != nil {
+		return nil, state.err
+	}
 	return matchs, nil
 }
 
 func (p *ambiguousPath) evaluateWithPaths(ctx context.Context, parameter interface{}) (interface{}, error) {
+	ctx, state := withVisitState(ctx)
 	m := map[string]interface{}{}
 	p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) {
 		m[toJSONPath(convertPath(keys))] = match
 	})
+	if state.err != nil {
+		return nil, state.err
+	}
 	return m, nil
 }
 
