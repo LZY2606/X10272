@@ -11,7 +11,7 @@ type CollectFullPathsContextKey struct{}
 type path interface {
 	evaluate(c context.Context, parameter interface{}) (interface{}, error)
 	evaluateWithPaths(c context.Context, parameter interface{}) (interface{}, error)
-	visitMatchs(c context.Context, r interface{}, visit pathMatcher)
+	visitMatchs(c context.Context, r interface{}, visit pathMatcher) error
 	withPlainSelector(plainSelector) path
 	withAmbiguousSelector(ambiguousSelector) path
 }
@@ -64,11 +64,12 @@ func (p plainPath) matcher(ctx context.Context, r interface{}, match ambiguousMa
 	}
 }
 
-func (p plainPath) visitMatchs(ctx context.Context, r interface{}, visit pathMatcher) {
+func (p plainPath) visitMatchs(ctx context.Context, r interface{}, visit pathMatcher) error {
 	keys, res, err := p.evaluatePath(ctx, r, r)
 	if err == nil {
 		visit(keys, res)
 	}
+	return err
 }
 
 func (p plainPath) withPlainSelector(selector plainSelector) path {
@@ -89,22 +90,22 @@ type ambiguousPath struct {
 
 func (p *ambiguousPath) evaluate(ctx context.Context, parameter interface{}) (interface{}, error) {
 	matchs := []interface{}{}
-	p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) {
+	err := p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) {
 		matchs = append(matchs, match)
 	})
-	return matchs, nil
+	return matchs, err
 }
 
 func (p *ambiguousPath) evaluateWithPaths(ctx context.Context, parameter interface{}) (interface{}, error) {
 	m := map[string]interface{}{}
-	p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) {
+	err := p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) {
 		m[toJSONPath(convertPath(keys))] = match
 	})
-	return m, nil
+	return m, err
 }
 
-func (p *ambiguousPath) visitMatchs(ctx context.Context, r interface{}, visit pathMatcher) {
-	p.parent.visitMatchs(ctx, r, func(keys []interface{}, v interface{}) {
+func (p *ambiguousPath) visitMatchs(ctx context.Context, r interface{}, visit pathMatcher) error {
+	return p.parent.visitMatchs(ctx, r, func(keys []interface{}, v interface{}) {
 		p.branch(ctx, r, v, p.ending.matcher(ctx, r, visit.matcher(keys)))
 	})
 }

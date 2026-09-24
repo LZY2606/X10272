@@ -11,8 +11,10 @@ import (
 // plainSelector evaluate exactly one result
 type plainSelector func(c context.Context, r, v interface{}) (interface{}, interface{}, error)
 
-// ambiguousSelector evaluate wildcard
-type ambiguousSelector func(c context.Context, r, v interface{}, match ambiguousMatcher)
+// ambiguousSelector evaluate wildcard. A traversal error (cancellation or an
+// exhausted visit budget) aborts the whole evaluation; per-match errors are
+// swallowed by the matching logic.
+type ambiguousSelector func(c context.Context, r, v interface{}, match ambiguousMatcher) error
 
 // @
 func currentElementSelector() plainSelector {
@@ -42,8 +44,8 @@ func directSelector(key gval.Evaluable) plainSelector {
 
 // * / [*]
 func starSelector() ambiguousSelector {
-	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
-		visitAll(v, func(key string, val interface{}) { match(key, val) })
+	return func(c context.Context, r, v interface{}, match ambiguousMatcher) error {
+		return visitAll(c, v, func(key string, val interface{}) { match(key, val) })
 	}
 }
 
@@ -52,7 +54,7 @@ func multiSelector(keys []gval.Evaluable) ambiguousSelector {
 	if len(keys) == 0 {
 		return starSelector()
 	}
-	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	return func(c context.Context, r, v interface{}, match ambiguousMatcher) error {
 		for _, k := range keys {
 			e, wildcard, err := selectValue(c, k, r, v)
 			if err != nil {
@@ -60,6 +62,7 @@ func multiSelector(keys []gval.Evaluable) ambiguousSelector {
 			}
 			match(wildcard, e)
 		}
+		return nil
 	}
 }
 
@@ -134,42 +137,19 @@ func mapperSelector() ambiguousSelector {
 	return mapper
 }
 
-func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) {
+func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) error {
 	match([]interface{}{}, v)
-	visitAll(v, func(wildcard string, v interface{}) {
-		mapper(c, r, v, func(key interface{}, v interface{}) {
-			match(append([]interface{}{wildcard}, key.([]interface{})...), v)
+	return visitAll(c, v, func(wildcard string, child interface{}) {
+		mapper(c, r, child, func(key interface{}, cv interface{}) {
+			match(append([]interface{}{wildcard}, key.([]interface{})...), cv)
 		})
 	})
 }
 
-func visitAll(v interface{}, visit func(key string, v interface{})) {
-
-	switch v := v.(type) {
-
-	case []interface{}:
-		for i, e := range v {
-			k := strconv.Itoa(i)
-			visit(k, e)
-		}
-
-	case map[string]interface{}:
-		for k, e := range v {
-			visit(k, e)
-		}
-
-	case Array:
-		v.ForEach(visit)
-
-	case Object:
-		v.ForEach(visit)
-	}
-}
-
 // [? ]
 func filterSelector(filter gval.Evaluable) ambiguousSelector {
-	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
-		visitAll(v, func(wildcard string, v interface{}) {
+	return func(c context.Context, r, v interface{}, match ambiguousMatcher) error {
+		return visitAll(c, v, func(wildcard string, v interface{}) {
 			condition, err := filter.EvalBool(currentContext(c, v), r)
 			if err != nil {
 				return
@@ -184,25 +164,25 @@ func filterSelector(filter gval.Evaluable) ambiguousSelector {
 // [::]
 func rangeSelector(min, max, step gval.Evaluable) ambiguousSelector {
 
-	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	return func(c context.Context, r, v interface{}, match ambiguousMatcher) error {
 
 		c = currentContext(c, v)
 
-		min, err := min.EvalInt(c, r)
+		minI, err := min.EvalInt(c, r)
 		if err != nil {
-			return
+			return nil
 		}
-		max, err := max.EvalInt(c, r)
+		maxI, err := max.EvalInt(c, r)
 		if err != nil {
-			return
+			return nil
 		}
-		step, err := step.EvalInt(c, r)
+		stepI, err := step.EvalInt(c, r)
 		if err != nil {
-			return
+			return nil
 		}
 
-		if step == 0 {
-			step = 1
+		if stepI == 0 {
+			stepI = 1
 		}
 
 		// process v
@@ -210,46 +190,59 @@ func rangeSelector(min, max, step gval.Evaluable) ambiguousSelector {
 
 		case []interface{}:
 			n := len(o)
-			min = negmax(min, n)
-			max = negmax(max, n)
+			minI = negmax(minI, n)
+			maxI = negmax(maxI, n)
 
-			if min > max {
-				return
+			if minI > maxI {
+				return nil
 			}
 
-			if step > 0 {
-				for i := min; i < max; i += step {
+			if stepI > 0 {
+				for i := minI; i < maxI; i += stepI {
+					if err := guardFrom(c).enter(c); err != nil {
+						return err
+					}
 					match(strconv.Itoa(i), o[i])
 				}
 			} else {
-				for i := max - 1; i >= min; i += step {
+				for i := maxI - 1; i >= minI; i += stepI {
+					if err := guardFrom(c).enter(c); err != nil {
+						return err
+					}
 					match(strconv.Itoa(i), o[i])
 				}
 			}
 
 		case Array:
 			n := o.Len()
-			min = negmax(min, n)
-			max = negmax(max, n)
+			minI = negmax(minI, n)
+			maxI = negmax(maxI, n)
 
-			if min > max {
-				return
+			if minI > maxI {
+				return nil
 			}
 
-			if step > 0 {
-				for i := min; i < max; i += step {
+			if stepI > 0 {
+				for i := minI; i < maxI; i += stepI {
+					if err := guardFrom(c).enter(c); err != nil {
+						return err
+					}
 					k := strconv.Itoa(i)
-					r, _ := o.SelectGVal(c, k)
-					match(k, r)
+					rv, _ := o.SelectGVal(c, k)
+					match(k, rv)
 				}
 			} else {
-				for i := max - 1; i >= min; i += step {
+				for i := maxI - 1; i >= minI; i += stepI {
+					if err := guardFrom(c).enter(c); err != nil {
+						return err
+					}
 					k := strconv.Itoa(i)
-					r, _ := o.SelectGVal(c, k)
-					match(k, r)
+					rv, _ := o.SelectGVal(c, k)
+					match(k, rv)
 				}
 			}
 		}
+		return nil
 	}
 }
 
