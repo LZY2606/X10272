@@ -3,6 +3,7 @@ package jsonpath
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/PaesslerAG/gval"
@@ -134,7 +135,53 @@ func mapperSelector() ambiguousSelector {
 	return mapper
 }
 
+// maxMapperVisits bounds the number of nodes a single evaluation of the
+// recursive descent selector (..) may visit. The budget keeps evaluation
+// total even for cyclic or adversarially deep input values. It is enforced
+// inside mapper, the same function used by the production evaluation path;
+// the budget itself travels on the evaluation context so no state is shared
+// between evaluations of a reused evaluable.
+const maxMapperVisits = 10000
+
+type visitBudgetContextKey struct{}
+
+type visitBudget struct {
+	remaining int
+	err       error
+}
+
+func withVisitBudget(c context.Context) context.Context {
+	if _, ok := c.Value(visitBudgetContextKey{}).(*visitBudget); ok {
+		return c
+	}
+	return context.WithValue(c, visitBudgetContextKey{}, &visitBudget{remaining: maxMapperVisits})
+}
+
+func visitBudgetFrom(c context.Context) *visitBudget {
+	b, _ := c.Value(visitBudgetContextKey{}).(*visitBudget)
+	return b
+}
+
+func (b *visitBudget) visit(c context.Context) bool {
+	if b.err != nil {
+		return false
+	}
+	if err := c.Err(); err != nil {
+		b.err = err
+		return false
+	}
+	if b.remaining <= 0 {
+		b.err = fmt.Errorf("jsonpath: recursive descent visit budget of %d exceeded", maxMapperVisits)
+		return false
+	}
+	b.remaining--
+	return true
+}
+
 func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	if b := visitBudgetFrom(c); b != nil && !b.visit(c) {
+		return
+	}
 	match([]interface{}{}, v)
 	visitAll(v, func(wildcard string, v interface{}) {
 		mapper(c, r, v, func(key interface{}, v interface{}) {
@@ -143,6 +190,9 @@ func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) {
 	})
 }
 
+// visitAll enumerates the direct children of v. Object children are visited
+// in sorted key order so that wildcard, filter and recursive descent
+// evaluation produce a reproducible order independent of map enumeration.
 func visitAll(v interface{}, visit func(key string, v interface{})) {
 
 	switch v := v.(type) {
@@ -154,15 +204,31 @@ func visitAll(v interface{}, visit func(key string, v interface{})) {
 		}
 
 	case map[string]interface{}:
-		for k, e := range v {
-			visit(k, e)
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			visit(k, v[k])
 		}
 
 	case Array:
 		v.ForEach(visit)
 
 	case Object:
-		v.ForEach(visit)
+		type keyValue struct {
+			key   string
+			value interface{}
+		}
+		elements := []keyValue{}
+		v.ForEach(func(key string, value interface{}) {
+			elements = append(elements, keyValue{key, value})
+		})
+		sort.Slice(elements, func(i, j int) bool { return elements[i].key < elements[j].key })
+		for _, e := range elements {
+			visit(e.key, e.value)
+		}
 	}
 }
 

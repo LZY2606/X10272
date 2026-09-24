@@ -41,9 +41,7 @@ func parseJSONObject(ctx context.Context, p *gval.Parser) (gval.Evaluable, error
 				return nil, err
 			}
 			if p.Scan() != ':' {
-				if err != nil {
-					return nil, p.Expected("object", ':')
-				}
+				return nil, p.Expected("object", ':')
 			}
 			e, err := parseJSONObjectElement(ctx, p, hasWildcard, key)
 			if err != nil {
@@ -94,6 +92,7 @@ func (kv keyValuePair) visitElements(c context.Context, v interface{}, visit key
 }
 
 func (kv keyValueMatcher) visitElements(c context.Context, v interface{}, visit keyValueVisitor) (err error) {
+	c = withVisitBudget(c)
 	kv.matcher(c, v, func(keys []interface{}, match interface{}) {
 		key, er := kv.key.EvalString(context.WithValue(c, placeholdersContextKey{}, keys), v)
 		if er != nil {
@@ -101,6 +100,11 @@ func (kv keyValueMatcher) visitElements(c context.Context, v interface{}, visit 
 		}
 		visit(key, match)
 	})
+	if err == nil {
+		if b := visitBudgetFrom(c); b != nil && b.err != nil {
+			err = b.err
+		}
+	}
 	return
 }
 
