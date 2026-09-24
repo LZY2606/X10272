@@ -25,7 +25,7 @@ type keyValuePair struct {
 
 type keyValueMatcher struct {
 	key     gval.Evaluable
-	matcher func(c context.Context, r interface{}, visit pathMatcher)
+	matcher func(c context.Context, r interface{}, visit pathMatcher) error
 }
 
 func parseJSONObject(ctx context.Context, p *gval.Parser) (gval.Evaluable, error) {
@@ -94,14 +94,14 @@ func (kv keyValuePair) visitElements(c context.Context, v interface{}, visit key
 }
 
 func (kv keyValueMatcher) visitElements(c context.Context, v interface{}, visit keyValueVisitor) (err error) {
-	kv.matcher(c, v, func(keys []interface{}, match interface{}) {
+	return kv.matcher(c, v, func(keys []interface{}, match interface{}) error {
 		key, er := kv.key.EvalString(context.WithValue(c, placeholdersContextKey{}, keys), v)
 		if er != nil {
-			err = er
+			return er
 		}
 		visit(key, match)
+		return nil
 	})
-	return
 }
 
 func (j *jsonObjectSlice) addElements(e jsonObject) {
@@ -109,6 +109,7 @@ func (j *jsonObjectSlice) addElements(e jsonObject) {
 }
 
 func (j jsonObjectSlice) evaluable(c context.Context, v interface{}) (interface{}, error) {
+	c = withVisitBudget(c)
 	vs := map[string]interface{}{}
 
 	err := j.visitElements(c, v, func(key string, value interface{}) { vs[key] = value })

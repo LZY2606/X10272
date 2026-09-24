@@ -3,6 +3,7 @@ package jsonpath
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/PaesslerAG/gval"
@@ -12,7 +13,7 @@ import (
 type plainSelector func(c context.Context, r, v interface{}) (interface{}, interface{}, error)
 
 // ambiguousSelector evaluate wildcard
-type ambiguousSelector func(c context.Context, r, v interface{}, match ambiguousMatcher)
+type ambiguousSelector func(c context.Context, r, v interface{}, match ambiguousMatcher) error
 
 // @
 func currentElementSelector() plainSelector {
@@ -42,8 +43,10 @@ func directSelector(key gval.Evaluable) plainSelector {
 
 // * / [*]
 func starSelector() ambiguousSelector {
-	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
-		visitAll(v, func(key string, val interface{}) { match(key, val) })
+	return func(c context.Context, r, v interface{}, match ambiguousMatcher) error {
+		return visitAll(v, func(key string, val interface{}) error {
+			return match(key, val)
+		})
 	}
 }
 
@@ -52,14 +55,17 @@ func multiSelector(keys []gval.Evaluable) ambiguousSelector {
 	if len(keys) == 0 {
 		return starSelector()
 	}
-	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	return func(c context.Context, r, v interface{}, match ambiguousMatcher) error {
 		for _, k := range keys {
 			e, wildcard, err := selectValue(c, k, r, v)
 			if err != nil {
 				continue
 			}
-			match(wildcard, e)
+			if err := match(wildcard, e); err != nil {
+				return err
+			}
 		}
+		return nil
 	}
 }
 
@@ -134,49 +140,86 @@ func mapperSelector() ambiguousSelector {
 	return mapper
 }
 
-func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) {
-	match([]interface{}{}, v)
-	visitAll(v, func(wildcard string, v interface{}) {
-		mapper(c, r, v, func(key interface{}, v interface{}) {
-			match(append([]interface{}{wildcard}, key.([]interface{})...), v)
+func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) error {
+	if err := c.Err(); err != nil {
+		return fmt.Errorf("jsonpath: recursive descent aborted: %w", err)
+	}
+	if err := visitBudgetFrom(c).visit(); err != nil {
+		return err
+	}
+	if err := match([]interface{}{}, v); err != nil {
+		return err
+	}
+	return visitAll(v, func(wildcard string, v interface{}) error {
+		return mapper(c, r, v, func(key interface{}, v interface{}) error {
+			return match(append([]interface{}{wildcard}, key.([]interface{})...), v)
 		})
 	})
 }
 
-func visitAll(v interface{}, visit func(key string, v interface{})) {
+// visitAll enumerates container members. Arrays are visited in index order and
+// map[string]interface{} values in lexicographic key order, so wildcard and
+// recursive-descent results are reproducible. Custom Array/Object types keep
+// the order reported by their ForEach implementation.
+func visitAll(v interface{}, visit func(key string, v interface{}) error) error {
 
 	switch v := v.(type) {
 
 	case []interface{}:
 		for i, e := range v {
 			k := strconv.Itoa(i)
-			visit(k, e)
+			if err := visit(k, e); err != nil {
+				return err
+			}
 		}
 
 	case map[string]interface{}:
-		for k, e := range v {
-			visit(k, e)
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if err := visit(k, v[k]); err != nil {
+				return err
+			}
 		}
 
 	case Array:
-		v.ForEach(visit)
+		var err error
+		v.ForEach(func(key string, val interface{}) {
+			if err != nil {
+				return
+			}
+			err = visit(key, val)
+		})
+		return err
 
 	case Object:
-		v.ForEach(visit)
+		var err error
+		v.ForEach(func(key string, val interface{}) {
+			if err != nil {
+				return
+			}
+			err = visit(key, val)
+		})
+		return err
 	}
+	return nil
 }
 
 // [? ]
 func filterSelector(filter gval.Evaluable) ambiguousSelector {
-	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
-		visitAll(v, func(wildcard string, v interface{}) {
+	return func(c context.Context, r, v interface{}, match ambiguousMatcher) error {
+		return visitAll(v, func(wildcard string, v interface{}) error {
 			condition, err := filter.EvalBool(currentContext(c, v), r)
 			if err != nil {
-				return
+				return nil
 			}
 			if condition {
-				match(wildcard, v)
+				return match(wildcard, v)
 			}
+			return nil
 		})
 	}
 }
@@ -184,21 +227,21 @@ func filterSelector(filter gval.Evaluable) ambiguousSelector {
 // [::]
 func rangeSelector(min, max, step gval.Evaluable) ambiguousSelector {
 
-	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	return func(c context.Context, r, v interface{}, match ambiguousMatcher) error {
 
 		c = currentContext(c, v)
 
 		min, err := min.EvalInt(c, r)
 		if err != nil {
-			return
+			return nil
 		}
 		max, err := max.EvalInt(c, r)
 		if err != nil {
-			return
+			return nil
 		}
 		step, err := step.EvalInt(c, r)
 		if err != nil {
-			return
+			return nil
 		}
 
 		if step == 0 {
@@ -214,16 +257,20 @@ func rangeSelector(min, max, step gval.Evaluable) ambiguousSelector {
 			max = negmax(max, n)
 
 			if min > max {
-				return
+				return nil
 			}
 
 			if step > 0 {
 				for i := min; i < max; i += step {
-					match(strconv.Itoa(i), o[i])
+					if err := match(strconv.Itoa(i), o[i]); err != nil {
+						return err
+					}
 				}
 			} else {
 				for i := max - 1; i >= min; i += step {
-					match(strconv.Itoa(i), o[i])
+					if err := match(strconv.Itoa(i), o[i]); err != nil {
+						return err
+					}
 				}
 			}
 
@@ -233,23 +280,28 @@ func rangeSelector(min, max, step gval.Evaluable) ambiguousSelector {
 			max = negmax(max, n)
 
 			if min > max {
-				return
+				return nil
 			}
 
 			if step > 0 {
 				for i := min; i < max; i += step {
 					k := strconv.Itoa(i)
 					r, _ := o.SelectGVal(c, k)
-					match(k, r)
+					if err := match(k, r); err != nil {
+						return err
+					}
 				}
 			} else {
 				for i := max - 1; i >= min; i += step {
 					k := strconv.Itoa(i)
 					r, _ := o.SelectGVal(c, k)
-					match(k, r)
+					if err := match(k, r); err != nil {
+						return err
+					}
 				}
 			}
 		}
+		return nil
 	}
 }
 
