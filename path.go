@@ -35,6 +35,9 @@ func (p plainPath) evaluateWithPaths(ctx context.Context, root interface{}) (int
 func (p plainPath) evaluatePath(ctx context.Context, root, value interface{}) ([]interface{}, interface{}, error) {
 	keys := []interface{}{}
 	for _, sel := range p {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		k, v, err := sel(ctx, root, value)
 		if err != nil {
 			return nil, nil, err
@@ -142,8 +145,11 @@ func convertPath(segments []interface{}) []interface{} {
 		if s, ok := sRaw.([]interface{}); ok {
 			liIndex := len(s) - 1
 
-			if (liIndex >= 0 && i == sCount-1) || (i > 0 && liIndex < sCount) {
-				s = convertPath(append([]interface{}{s[liIndex]}, s[:liIndex]...))
+			if liIndex >= 0 {
+				_, lastIsList := s[liIndex].([]interface{})
+				if i == sCount-1 || (i > 0 && liIndex < sCount) || lastIsList {
+					s = convertPath(append([]interface{}{s[liIndex]}, s[:liIndex]...))
+				}
 			}
 
 			paths = append(paths, convertPath(s)...)
