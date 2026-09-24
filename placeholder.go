@@ -101,6 +101,9 @@ func (kv keyValueMatcher) visitElements(c context.Context, v interface{}, visit 
 		}
 		visit(key, match)
 	})
+	if err == nil && visitBudgetExhausted(c) {
+		err = ErrVisitBudgetExhausted
+	}
 	return
 }
 
