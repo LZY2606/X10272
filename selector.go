@@ -3,6 +3,7 @@ package jsonpath
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/PaesslerAG/gval"
@@ -131,15 +132,23 @@ func selectValue(c context.Context, key gval.Evaluable, r, v interface{}) (value
 
 // ..
 func mapperSelector() ambiguousSelector {
-	return mapper
+	return mapperVisit
 }
 
-func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) {
+func mapperVisit(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	mapperAt(c, r, v, match, 0)
+}
+
+func mapperAt(c context.Context, r, v interface{}, match ambiguousMatcher, depth int) {
+	if err := enterNode(c, depth); err != nil {
+		visitStateFromContext(c).markAborted(err)
+		return
+	}
 	match([]interface{}{}, v)
 	visitAll(v, func(wildcard string, v interface{}) {
-		mapper(c, r, v, func(key interface{}, v interface{}) {
+		mapperAt(c, r, v, func(key interface{}, v interface{}) {
 			match(append([]interface{}{wildcard}, key.([]interface{})...), v)
-		})
+		}, depth+1)
 	})
 }
 
@@ -154,8 +163,13 @@ func visitAll(v interface{}, visit func(key string, v interface{})) {
 		}
 
 	case map[string]interface{}:
-		for k, e := range v {
-			visit(k, e)
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			visit(k, v[k])
 		}
 
 	case Array:
@@ -219,10 +233,18 @@ func rangeSelector(min, max, step gval.Evaluable) ambiguousSelector {
 
 			if step > 0 {
 				for i := min; i < max; i += step {
+					if err := c.Err(); err != nil {
+						visitStateFromContext(c).markAborted(err)
+						return
+					}
 					match(strconv.Itoa(i), o[i])
 				}
 			} else {
 				for i := max - 1; i >= min; i += step {
+					if err := c.Err(); err != nil {
+						visitStateFromContext(c).markAborted(err)
+						return
+					}
 					match(strconv.Itoa(i), o[i])
 				}
 			}
@@ -238,12 +260,20 @@ func rangeSelector(min, max, step gval.Evaluable) ambiguousSelector {
 
 			if step > 0 {
 				for i := min; i < max; i += step {
+					if err := c.Err(); err != nil {
+						visitStateFromContext(c).markAborted(err)
+						return
+					}
 					k := strconv.Itoa(i)
 					r, _ := o.SelectGVal(c, k)
 					match(k, r)
 				}
 			} else {
 				for i := max - 1; i >= min; i += step {
+					if err := c.Err(); err != nil {
+						visitStateFromContext(c).markAborted(err)
+						return
+					}
 					k := strconv.Itoa(i)
 					r, _ := o.SelectGVal(c, k)
 					match(k, r)
