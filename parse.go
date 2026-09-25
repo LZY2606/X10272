@@ -52,9 +52,37 @@ func (p *parser) parse(c context.Context) (r gval.Evaluable, err error) {
 	}
 	collectFullPaths := c.Value(CollectFullPathsContextKey{})
 	if b, ok := collectFullPaths.(bool); ok && b {
-		return p.path.evaluateWithPaths, nil
+		eval := p.path.evaluateWithPaths
+		return func(ctx context.Context, parameter interface{}) (interface{}, error) {
+			ctx = withRecursionGuard(ctx)
+			value, err := eval(ctx, parameter)
+			if err != nil {
+				return value, err
+			}
+			if g := recursionGuardFromContext(ctx); g != nil && g.err != nil {
+				return value, g.err
+			}
+			if err := ctx.Err(); err != nil {
+				return value, err
+			}
+			return value, nil
+		}, nil
 	}
-	return p.path.evaluate, nil
+	eval := p.path.evaluate
+	return func(ctx context.Context, parameter interface{}) (interface{}, error) {
+		ctx = withRecursionGuard(ctx)
+		value, err := eval(ctx, parameter)
+		if err != nil {
+			return value, err
+		}
+		if g := recursionGuardFromContext(ctx); g != nil && g.err != nil {
+			return value, g.err
+		}
+		if err := ctx.Err(); err != nil {
+			return value, err
+		}
+		return value, nil
+	}, nil
 }
 
 func (p *parser) parsePath(c context.Context) error {

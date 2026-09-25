@@ -3,6 +3,7 @@ package jsonpath
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/PaesslerAG/gval"
@@ -135,8 +136,14 @@ func mapperSelector() ambiguousSelector {
 }
 
 func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) {
-	match([]interface{}{}, v)
+	guard := recursionGuardFromContext(c)
+	if guard == nil || guard.enter() == nil {
+		match([]interface{}{}, v)
+	}
 	visitAll(v, func(wildcard string, v interface{}) {
+		if guard != nil && guard.err != nil {
+			return
+		}
 		mapper(c, r, v, func(key interface{}, v interface{}) {
 			match(append([]interface{}{wildcard}, key.([]interface{})...), v)
 		})
@@ -154,15 +161,29 @@ func visitAll(v interface{}, visit func(key string, v interface{})) {
 		}
 
 	case map[string]interface{}:
-		for k, e := range v {
-			visit(k, e)
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			visit(k, v[k])
 		}
 
 	case Array:
 		v.ForEach(visit)
 
 	case Object:
-		v.ForEach(visit)
+		type member struct {
+			k string
+			v interface{}
+		}
+		members := []member{}
+		v.ForEach(func(k string, val interface{}) { members = append(members, member{k, val}) })
+		sort.SliceStable(members, func(i, j int) bool { return members[i].k < members[j].k })
+		for _, m := range members {
+			visit(m.k, m.v)
+		}
 	}
 }
 
