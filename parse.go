@@ -52,9 +52,18 @@ func (p *parser) parse(c context.Context) (r gval.Evaluable, err error) {
 	}
 	collectFullPaths := c.Value(CollectFullPathsContextKey{})
 	if b, ok := collectFullPaths.(bool); ok && b {
-		return p.path.evaluateWithPaths, nil
+		return withRecursiveDescentBudget(p.path.evaluateWithPaths), nil
 	}
-	return p.path.evaluate, nil
+	return withRecursiveDescentBudget(p.path.evaluate), nil
+}
+
+// withRecursiveDescentBudget installs a fresh per-call recursive descent
+// budget so that a single evaluation can abort on cyclic or excessive input
+// without leaving any counter on the reusable evaluable.
+func withRecursiveDescentBudget(eval func(context.Context, interface{}) (interface{}, error)) gval.Evaluable {
+	return func(ctx context.Context, parameter interface{}) (interface{}, error) {
+		return eval(installRecursiveDescentBudget(ctx), parameter)
+	}
 }
 
 func (p *parser) parsePath(c context.Context) error {

@@ -3,6 +3,7 @@ package jsonpath
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/PaesslerAG/gval"
@@ -12,7 +13,7 @@ import (
 type plainSelector func(c context.Context, r, v interface{}) (interface{}, interface{}, error)
 
 // ambiguousSelector evaluate wildcard
-type ambiguousSelector func(c context.Context, r, v interface{}, match ambiguousMatcher)
+type ambiguousSelector func(c context.Context, r, v interface{}, match ambiguousMatcher) error
 
 // @
 func currentElementSelector() plainSelector {
@@ -42,8 +43,15 @@ func directSelector(key gval.Evaluable) plainSelector {
 
 // * / [*]
 func starSelector() ambiguousSelector {
-	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
-		visitAll(v, func(key string, val interface{}) { match(key, val) })
+	return func(c context.Context, r, v interface{}, match ambiguousMatcher) error {
+		var abort error
+		visitAll(v, func(key string, val interface{}) {
+			if abort != nil {
+				return
+			}
+			abort = match(key, val)
+		})
+		return abort
 	}
 }
 
@@ -52,14 +60,17 @@ func multiSelector(keys []gval.Evaluable) ambiguousSelector {
 	if len(keys) == 0 {
 		return starSelector()
 	}
-	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	return func(c context.Context, r, v interface{}, match ambiguousMatcher) error {
 		for _, k := range keys {
 			e, wildcard, err := selectValue(c, k, r, v)
 			if err != nil {
 				continue
 			}
-			match(wildcard, e)
+			if err := match(wildcard, e); err != nil {
+				return err
+			}
 		}
+		return nil
 	}
 }
 
@@ -134,15 +145,27 @@ func mapperSelector() ambiguousSelector {
 	return mapper
 }
 
-func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) {
-	match([]interface{}{}, v)
-	visitAll(v, func(wildcard string, v interface{}) {
-		mapper(c, r, v, func(key interface{}, v interface{}) {
-			match(append([]interface{}{wildcard}, key.([]interface{})...), v)
+func mapper(c context.Context, r, v interface{}, match ambiguousMatcher) error {
+	if err := chargeRecursiveDescentVisit(c); err != nil {
+		return err
+	}
+	if err := match([]interface{}{}, v); err != nil {
+		return err
+	}
+	var abort error
+	visitAll(v, func(wildcard string, child interface{}) {
+		if abort != nil {
+			return
+		}
+		abort = mapper(c, r, child, func(key interface{}, cv interface{}) error {
+			return match(append([]interface{}{wildcard}, key.([]interface{})...), cv)
 		})
 	})
+	return abort
 }
 
+// visitAll visits arrays in index order and objects in sorted key order, so
+// that wildcard and recursive descent results are reproducible across runs.
 func visitAll(v interface{}, visit func(key string, v interface{})) {
 
 	switch v := v.(type) {
@@ -154,8 +177,13 @@ func visitAll(v interface{}, visit func(key string, v interface{})) {
 		}
 
 	case map[string]interface{}:
-		for k, e := range v {
-			visit(k, e)
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			visit(k, v[k])
 		}
 
 	case Array:
@@ -168,41 +196,53 @@ func visitAll(v interface{}, visit func(key string, v interface{})) {
 
 // [? ]
 func filterSelector(filter gval.Evaluable) ambiguousSelector {
-	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	return func(c context.Context, r, v interface{}, match ambiguousMatcher) error {
+		var abort error
 		visitAll(v, func(wildcard string, v interface{}) {
+			if abort != nil {
+				return
+			}
 			condition, err := filter.EvalBool(currentContext(c, v), r)
 			if err != nil {
 				return
 			}
 			if condition {
-				match(wildcard, v)
+				abort = match(wildcard, v)
 			}
 		})
+		return abort
 	}
 }
 
 // [::]
 func rangeSelector(min, max, step gval.Evaluable) ambiguousSelector {
 
-	return func(c context.Context, r, v interface{}, match ambiguousMatcher) {
+	return func(c context.Context, r, v interface{}, match ambiguousMatcher) error {
 
 		c = currentContext(c, v)
 
-		min, err := min.EvalInt(c, r)
+		lo, err := min.EvalInt(c, r)
 		if err != nil {
-			return
+			return nil
 		}
-		max, err := max.EvalInt(c, r)
+		hi, err := max.EvalInt(c, r)
 		if err != nil {
-			return
+			return nil
 		}
-		step, err := step.EvalInt(c, r)
+		st, err := step.EvalInt(c, r)
 		if err != nil {
-			return
+			return nil
 		}
 
-		if step == 0 {
-			step = 1
+		if st == 0 {
+			st = 1
+		}
+
+		var abort error
+		emit := func(k string, val interface{}) {
+			if abort == nil {
+				abort = match(k, val)
+			}
 		}
 
 		// process v
@@ -210,46 +250,59 @@ func rangeSelector(min, max, step gval.Evaluable) ambiguousSelector {
 
 		case []interface{}:
 			n := len(o)
-			min = negmax(min, n)
-			max = negmax(max, n)
+			lo = negmax(lo, n)
+			hi = negmax(hi, n)
 
-			if min > max {
-				return
+			if lo > hi {
+				return nil
 			}
 
-			if step > 0 {
-				for i := min; i < max; i += step {
-					match(strconv.Itoa(i), o[i])
+			if st > 0 {
+				for i := lo; i < hi; i += st {
+					emit(strconv.Itoa(i), o[i])
+					if abort != nil {
+						return abort
+					}
 				}
 			} else {
-				for i := max - 1; i >= min; i += step {
-					match(strconv.Itoa(i), o[i])
+				for i := hi - 1; i >= lo; i += st {
+					emit(strconv.Itoa(i), o[i])
+					if abort != nil {
+						return abort
+					}
 				}
 			}
 
 		case Array:
 			n := o.Len()
-			min = negmax(min, n)
-			max = negmax(max, n)
+			lo = negmax(lo, n)
+			hi = negmax(hi, n)
 
-			if min > max {
-				return
+			if lo > hi {
+				return nil
 			}
 
-			if step > 0 {
-				for i := min; i < max; i += step {
+			if st > 0 {
+				for i := lo; i < hi; i += st {
 					k := strconv.Itoa(i)
-					r, _ := o.SelectGVal(c, k)
-					match(k, r)
+					val, _ := o.SelectGVal(c, k)
+					emit(k, val)
+					if abort != nil {
+						return abort
+					}
 				}
 			} else {
-				for i := max - 1; i >= min; i += step {
+				for i := hi - 1; i >= lo; i += st {
 					k := strconv.Itoa(i)
-					r, _ := o.SelectGVal(c, k)
-					match(k, r)
+					val, _ := o.SelectGVal(c, k)
+					emit(k, val)
+					if abort != nil {
+						return abort
+					}
 				}
 			}
 		}
+		return abort
 	}
 }
 

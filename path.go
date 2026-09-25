@@ -11,14 +11,14 @@ type CollectFullPathsContextKey struct{}
 type path interface {
 	evaluate(c context.Context, parameter interface{}) (interface{}, error)
 	evaluateWithPaths(c context.Context, parameter interface{}) (interface{}, error)
-	visitMatchs(c context.Context, r interface{}, visit pathMatcher)
+	visitMatchs(c context.Context, r interface{}, visit pathMatcher) error
 	withPlainSelector(plainSelector) path
 	withAmbiguousSelector(ambiguousSelector) path
 }
 
 type plainPath []plainSelector
 
-type ambiguousMatcher func(key, v interface{})
+type ambiguousMatcher func(key, v interface{}) error
 
 func (p plainPath) evaluate(ctx context.Context, root interface{}) (interface{}, error) {
 	_, value, err := p.evaluatePath(ctx, root, root)
@@ -27,9 +27,12 @@ func (p plainPath) evaluate(ctx context.Context, root interface{}) (interface{},
 
 func (p plainPath) evaluateWithPaths(ctx context.Context, root interface{}) (interface{}, error) {
 	keys, value, err := p.evaluatePath(ctx, root, root)
+	if err != nil {
+		return nil, err
+	}
 	m := map[string]interface{}{}
 	m[toJSONPath(keys)] = value
-	return m, err
+	return m, nil
 }
 
 func (p plainPath) evaluatePath(ctx context.Context, root, value interface{}) ([]interface{}, interface{}, error) {
@@ -51,24 +54,34 @@ func (p plainPath) matcher(ctx context.Context, r interface{}, match ambiguousMa
 	if len(p) == 0 {
 		return match
 	}
-	return func(k, v interface{}) {
+	return func(k, v interface{}) error {
 		keys := k
 		collectFullPaths := ctx.Value(CollectFullPathsContextKey{})
 		ks, res, err := p.evaluatePath(ctx, r, v)
 		if b, ok := collectFullPaths.(bool); ok && b {
 			keys = append(ks, k)
 		}
-		if err == nil {
-			match(keys, res)
+		if err != nil {
+			// An error in a continuation selector only drops this match;
+			// a context cancellation or exhausted budget aborts the walk.
+			if isAbortError(ctx, err) {
+				return err
+			}
+			return nil
 		}
+		return match(keys, res)
 	}
 }
 
-func (p plainPath) visitMatchs(ctx context.Context, r interface{}, visit pathMatcher) {
+func (p plainPath) visitMatchs(ctx context.Context, r interface{}, visit pathMatcher) error {
 	keys, res, err := p.evaluatePath(ctx, r, r)
-	if err == nil {
-		visit(keys, res)
+	if err != nil {
+		if isAbortError(ctx, err) {
+			return err
+		}
+		return nil
 	}
+	return visit(keys, res)
 }
 
 func (p plainPath) withPlainSelector(selector plainSelector) path {
@@ -89,29 +102,37 @@ type ambiguousPath struct {
 
 func (p *ambiguousPath) evaluate(ctx context.Context, parameter interface{}) (interface{}, error) {
 	matchs := []interface{}{}
-	p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) {
+	err := p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) error {
 		matchs = append(matchs, match)
+		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
 	return matchs, nil
 }
 
 func (p *ambiguousPath) evaluateWithPaths(ctx context.Context, parameter interface{}) (interface{}, error) {
 	m := map[string]interface{}{}
-	p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) {
+	err := p.visitMatchs(ctx, parameter, func(keys []interface{}, match interface{}) error {
 		m[toJSONPath(convertPath(keys))] = match
+		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
 	return m, nil
 }
 
-func (p *ambiguousPath) visitMatchs(ctx context.Context, r interface{}, visit pathMatcher) {
-	p.parent.visitMatchs(ctx, r, func(keys []interface{}, v interface{}) {
-		p.branch(ctx, r, v, p.ending.matcher(ctx, r, visit.matcher(keys)))
+func (p *ambiguousPath) visitMatchs(ctx context.Context, r interface{}, visit pathMatcher) error {
+	return p.parent.visitMatchs(ctx, r, func(keys []interface{}, v interface{}) error {
+		return p.branch(ctx, r, v, p.ending.matcher(ctx, r, visit.matcher(keys)))
 	})
 }
 
 func (p *ambiguousPath) branchMatcher(ctx context.Context, r interface{}, m ambiguousMatcher) ambiguousMatcher {
-	return func(k, v interface{}) {
-		p.branch(ctx, r, v, m)
+	return func(k, v interface{}) error {
+		return p.branch(ctx, r, v, m)
 	}
 }
 
@@ -126,12 +147,27 @@ func (p *ambiguousPath) withAmbiguousSelector(selector ambiguousSelector) path {
 	}
 }
 
-type pathMatcher func(keys []interface{}, match interface{})
+type pathMatcher func(keys []interface{}, match interface{}) error
 
 func (m pathMatcher) matcher(keys []interface{}) ambiguousMatcher {
-	return func(key, match interface{}) {
-		m(append(keys, key), match)
+	// Every sibling match gets its own slice. Reusing the parent backing array
+	// (the append fast path) would let a later sibling overwrite the access
+	// position recorded for an earlier sibling.
+	keysCopy := make([]interface{}, len(keys))
+	copy(keysCopy, keys)
+	return func(key, match interface{}) error {
+		return m(append(keysCopy, key), match)
 	}
+}
+
+func isAbortError(ctx context.Context, err error) bool {
+	if err == ErrRecursiveDescentBudgetExhausted {
+		return true
+	}
+	if ce := ctx.Err(); ce != nil && err == ce {
+		return true
+	}
+	return false
 }
 
 func convertPath(segments []interface{}) []interface{} {

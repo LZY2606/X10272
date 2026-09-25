@@ -1,0 +1,16 @@
+{
+  "store": {
+    "books": [
+      {"id": "b0", "tags": ["x", "y"], "meta": {"reviews": []}},
+      {"id": "b1", "tags": [], "meta": {}},
+      {"id": "b2", "tags": ["z"]}
+    ],
+    "count": 3,
+    "name": "store"
+  },
+  "nums": [0, 10, 20, 30, 40],
+  "deep": {"l1": {"l2": {"l3": {"empty": [], "nothing": {}}}}},
+  "empties": [[], {}, [[]]],
+  "x": {"x": [1, 2]},
+  "list": [{"v": 1}, {"v": 2}, {"v": 3}]
+}
